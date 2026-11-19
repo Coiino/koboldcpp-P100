@@ -53,6 +53,115 @@ jobs:
         with:
           python-version: 3.8.10
 
+      - name: Apply Tesla P100 sm_60 Patches (common.cuh + mmvq.cu)
+        shell: python
+        run: |
+          import difflib, re, sys
+
+          def apply_exact_sub(path, src, pattern, replacement, label):
+              patched, count = re.subn(pattern, replacement, src, flags=re.MULTILINE)
+              if count != 1:
+                  print(f"[P100 Patch] ERROR ({label}) in {path}: expected 1 match, got {count}", file=sys.stderr)
+                  sys.exit(1)
+              return patched
+
+          # 1. common.cuh: 4-instruction PTX vmad dp4a for sm_60
+          common_path = "ggml/src/ggml-cuda/common.cuh"
+          with open(common_path, "r", encoding="utf-8", newline="") as f:
+              common_orig = f.read()
+
+          if "vmad.s32.s32.s32" in common_orig:
+              print(f"[P100 Patch] {common_path} already patched, skipping.")
+          else:
+              common_new = apply_exact_sub(
+                  common_path,
+                  common_orig,
+                  r"(#if\s+__CUDA_ARCH__\s*>=\s*GGML_CUDA_CC_DP4A\s*\|\|\s*defined\(GGML_USE_MUSA\)\r?\n"
+                  r"[ \t]*return\s+__dp4a\(a,\s*b,\s*c\);\r?\n)"
+                  r"(#else\b)",
+                  r"\1"
+                  "#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600\n"
+                  "    int res = c;\n"
+                  "    asm(\"vmad.s32.s32.s32 %0, %1.b0, %2.b0, %0;\" : \"+r\"(res) : \"r\"(a), \"r\"(b));\n"
+                  "    asm(\"vmad.s32.s32.s32 %0, %1.b1, %2.b1, %0;\" : \"+r\"(res) : \"r\"(a), \"r\"(b));\n"
+                  "    asm(\"vmad.s32.s32.s32 %0, %1.b2, %2.b2, %0;\" : \"+r\"(res) : \"r\"(a), \"r\"(b));\n"
+                  "    asm(\"vmad.s32.s32.s32 %0, %1.b3, %2.b3, %0;\" : \"+r\"(res) : \"r\"(a), \"r\"(b));\n"
+                  "    return res;\n"
+                  r"\2",
+                  "common.cuh vmad dp4a"
+              )
+              with open(common_path, "w", encoding="utf-8", newline="") as f:
+                  f.write(common_new)
+              print(f"[P100 Patch] Successfully patched {common_path}.")
+              print("".join(difflib.unified_diff(common_orig.splitlines(True), common_new.splitlines(True), fromfile=common_path, tofile=common_path)))
+
+          # 2. mmvq.cu: MMVQ_PARAMETERS_PASCAL (rows_per_block=4/2 for sm_60)
+          mmvq_path = "ggml/src/ggml-cuda/mmvq.cu"
+          with open(mmvq_path, "r", encoding="utf-8", newline="") as f:
+              mmvq_orig = f.read()
+
+          if "MMVQ_PARAMETERS_PASCAL" in mmvq_orig:
+              print(f"[P100 Patch] {mmvq_path} already patched, skipping.")
+          else:
+              mmvq_new = mmvq_orig
+              mmvq_new = apply_exact_sub(
+                  mmvq_path, mmvq_new,
+                  r"(MMVQ_PARAMETERS_GENERIC\s*=\s*0,\r?\n)",
+                  r"\1    MMVQ_PARAMETERS_PASCAL,\n",
+                  "mmvq enum"
+              )
+              mmvq_new = apply_exact_sub(
+                  mmvq_path, mmvq_new,
+                  r"(#elif\s+__CUDA_ARCH__\s*>=\s*GGML_CUDA_CC_VOLTA\s*&&\s*__CUDA_ARCH__\s*<\s*GGML_CUDA_CC_AMPERE)",
+                  "#elif __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL\n    return MMVQ_PARAMETERS_PASCAL;\n" + r"\1",
+                  "mmvq device table_id"
+              )
+              mmvq_new = apply_exact_sub(
+                  mmvq_path, mmvq_new,
+                  r"([ \t]*if\s*\(GGML_CUDA_CC_IS_NVIDIA\(cc\)\s*&&\s*ggml_cuda_highest_compiled_arch\(cc\)\s*>=\s*GGML_CUDA_CC_VOLTA)",
+                  "    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_PASCAL) {\n"
+                  "        return MMVQ_PARAMETERS_PASCAL;\n"
+                  "    }\n" + r"\1",
+                  "mmvq host table_id"
+              )
+              mmvq_new = apply_exact_sub(
+                  mmvq_path, mmvq_new,
+                  r"if\s*\(table_id\s*==\s*MMVQ_PARAMETERS_GENERIC\)",
+                  "if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_PASCAL)",
+                  "mmvq calc_nwarps"
+              )
+              mmvq_new = apply_exact_sub(
+                  mmvq_path, mmvq_new,
+                  r"if\s*\(table_id\s*==\s*MMVQ_PARAMETERS_GENERIC\s*\|\|\s*table_id\s*==\s*MMVQ_PARAMETERS_GCN",
+                  "if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_PASCAL || table_id == MMVQ_PARAMETERS_GCN",
+                  "mmvq calc_rows_per_block cond"
+              )
+              mmvq_new = apply_exact_sub(
+                  mmvq_path, mmvq_new,
+                  r"([ \t]*if\s*\(table_id\s*==\s*MMVQ_PARAMETERS_GB10\)\s*\{\r?\n[ \t]*return\s+type\s*==\s*GGML_TYPE_IQ2_S)",
+                  "                if (table_id == MMVQ_PARAMETERS_PASCAL) {\n"
+                  "                    switch (type) {\n"
+                  "                        case GGML_TYPE_Q4_0:\n"
+                  "                        case GGML_TYPE_Q4_1:\n"
+                  "                        case GGML_TYPE_Q5_0:\n"
+                  "                        case GGML_TYPE_Q5_1:\n"
+                  "                        case GGML_TYPE_Q8_0:\n"
+                  "                        case GGML_TYPE_Q4_K:\n"
+                  "                        case GGML_TYPE_Q5_K:\n"
+                  "                        case GGML_TYPE_Q6_K:\n"
+                  "                        case GGML_TYPE_IQ4_NL:\n"
+                  "                            return 4;\n"
+                  "                        default:\n"
+                  "                            return 2;\n"
+                  "                    }\n"
+                  "                }\n" + r"\1",
+                  "mmvq calc_rows_per_block pascal"
+              )
+              with open(mmvq_path, "w", encoding="utf-8", newline="") as f:
+                  f.write(mmvq_new)
+              print(f"[P100 Patch] Successfully patched {mmvq_path}.")
+              print("".join(difflib.unified_diff(mmvq_orig.splitlines(True), mmvq_new.splitlines(True), fromfile=mmvq_path, tofile=mmvq_path)))
+
       - name: Install python dependencies
         run: |
           python -m pip install --upgrade pip
@@ -75,8 +184,8 @@ jobs:
           :CheckProcess
           tasklist /FI "IMAGENAME eq %ProcessName%" | find /I "%ProcessName%" >nul
           if %errorlevel%==0 (
-              ping 127.0.0.1 /n 5 >nul
-              goto CheckProcess
+            ping 127.0.0.1 /n 5 >nul
+            goto CheckProcess
           )
           echo VS2019 Setup completed
           exit /b 0
@@ -109,33 +218,29 @@ jobs:
       - name: Build Non-CUDA
         id: make_build
         run: |
-          make LLAMA_VULKAN=1 LLAMA_PORTABLE=1 -j ${env:NUMBER_OF_PROCESSORS}
+          make LLAMA_VULKAN=1 LLAMA_PORTABLE=1 -j ${env:NUMBER_OF_PROCESSORS} LLAMA_NOAVX2=1
 
       - name: Build CUDA
         id: cmake_build
+        env:
+          KCPP_CUDA_ROOT: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
         run: |
-          mkdir build
-          cd build
-          cmake .. -DLLAMA_CUBLAS=ON -DCMAKE_SYSTEM_VERSION="10.0.19041.0"
-          cmake --build . --config Release -j 2
-          cd ..
+          cmake -S . -B build -G "Visual Studio 16 2019" -A x64 -T "cuda=$env:KCPP_CUDA_ROOT" "-DCUDAToolkit_ROOT=$env:KCPP_CUDA_ROOT" "-DKCPP_CUDA_EXPECTED_VERSION=12.1" -DLLAMA_CUBLAS=ON -DLLAMA_AVX=ON -DLLAMA_AVX2=OFF -DLLAMA_FMA=OFF -DCMAKE_CUDA_ARCHITECTURES="60-real" -DCMAKE_SYSTEM_VERSION="10.0.19041.0"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release -j 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # note: The libraries that come from the github cuda directory seem to be larger, so they are not recommended
-      # - name: Download CuBLAS Libraries
-      #   run: |
-      #     curl -L https://github.com/LostRuins/koboldcpp/releases/download/cuda11_cublas_libraries/cublas64_11.dll --output cublas64_11.dll
-      #     curl -L https://github.com/LostRuins/koboldcpp/releases/download/cuda11_cublas_libraries/cublasLt64_11.dll --output cublasLt64_11.dll
-      #     ls
       - name: Copy CuBLAS Libraries
+        env:
+          KCPP_CUDA_ROOT: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
         run: |
-          copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\bin\cublasLt64_12.dll" .
-          copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\bin\cublas64_12.dll" .
+          Copy-Item -LiteralPath (Join-Path $env:KCPP_CUDA_ROOT "bin\cublasLt64_12.dll") -Destination . -Force -ErrorAction Stop
+          Copy-Item -LiteralPath (Join-Path $env:KCPP_CUDA_ROOT "bin\cublas64_12.dll") -Destination . -Force -ErrorAction Stop
           ls
 
       - name: Package PyInstallers
         id: make_pyinstaller
         run: |
-          ./make_pyinstaller.bat
           ./make_pyinstaller_cuda.bat
 
       - name: Save artifact
@@ -143,84 +248,3 @@ jobs:
         with:
           name: kcpp_windows_pyinstallers
           path: dist/
-
-      - name: Generate VK Instructions
-        id: gen_vk_instructions
-        run: |
-          echo "If you cannot compile vulkan shaders yourself with glslc, you can manually patch in precompiled vulkan shader source files. Copy ggml-vulkan-shaders.cpp and ggml-vulkan-shaders.hpp to the ggml/src subdirectory in KoboldCpp source files before building." > vulkan-readme.txt
-
-      - name: Upload to GitHub Rolling Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload rolling dist/koboldcpp.exe --clobber
-          gh release upload rolling dist/koboldcpp-nocuda.exe --clobber
-
-      - name: Save Standalone Vulkan Shaders
-        uses: actions/upload-artifact@v6
-        with:
-          name: vulkan_precompiled_shaders
-          path: |
-            ggml/src/ggml-vulkan-shaders.cpp
-            ggml/src/ggml-vulkan-shaders.hpp
-            vulkan-readme.txt
-
-      - name: Build Tools
-        id: make_tools
-        run: |
-          make tools -j 4
-          New-Item -ItemType Directory -Path legacy
-          Copy-Item quantize_gpt2.exe -Destination legacy
-          Copy-Item quantize_gptj.exe -Destination legacy
-          Copy-Item quantize_mpt.exe -Destination legacy
-          Copy-Item quantize_neox.exe -Destination legacy
-          Copy-Item otherarch/tools/convert_hf_gpt2.py -Destination legacy
-          Copy-Item otherarch/tools/convert_hf_gptj.py -Destination legacy
-          Copy-Item otherarch/tools/convert_hf_mpt.py -Destination legacy
-          Copy-Item otherarch/tools/convert_hf_neox.py -Destination legacy
-          Copy-Item otherarch/tools/convert_llama_ggml_to_gguf.py -Destination legacy
-          Copy-Item otherarch/tools/convert_pt_rwkv.py -Destination legacy
-        shell: pwsh
-
-      - name: Upload Tools
-        uses: actions/upload-artifact@v6
-        with:
-          name: koboldcpp_tools
-          path: |
-            gguf-split.exe
-            quantize_gguf.exe
-            whispermain.exe
-            sdmain.exe
-            ttsmain.exe
-            convert_hf_to_gguf.py
-            convert_hf_to_gguf_update.py
-            conversion
-            gguf-py
-            legacy
-
-      - name: Package Tools Release
-        shell: pwsh
-        run: |
-          Compress-Archive `
-            -Path `
-              gguf-split.exe,
-              quantize_gguf.exe,
-              whispermain.exe,
-              sdmain.exe,
-              ttsmain.exe,
-              convert_hf_to_gguf.py,
-              convert_hf_to_gguf_update.py,
-              conversion,
-              gguf-py,
-              legacy `
-            -DestinationPath koboldcpp_tools.zip `
-            -Force
-
-      - name: Upload tools to GitHub Rolling Tools Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: pwsh
-        run: |
-          gh release upload kcpp_tools_rolling `
-            koboldcpp_tools.zip `
-            --clobber
