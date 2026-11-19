@@ -25,11 +25,11 @@ set(LLAMA_GPROF OFF)
 
 # instruction set specific
 option(LLAMA_AVX                    "llama: enable AVX"                                     ON)
-option(LLAMA_AVX2                   "llama: enable AVX2"                                    ON)
+option(LLAMA_AVX2                   "llama: enable AVX2"                                    OFF)
 option(LLAMA_AVX512                 "llama: enable AVX512"                                  OFF)
 option(LLAMA_AVX512_VBMI            "llama: enable AVX512-VBMI"                             OFF)
 option(LLAMA_AVX512_VNNI            "llama: enable AVX512-VNNI"                             OFF)
-option(LLAMA_FMA                    "llama: enable FMA"                                     ON)
+option(LLAMA_FMA                    "llama: enable FMA"                                     OFF)
 # in MSVC F16C is implied with AVX2/AVX512
 if (NOT MSVC)
     option(LLAMA_F16C               "llama: enable F16C"                                    ON)
@@ -37,7 +37,7 @@ endif()
 
 # 3rd party libs
 option(LLAMA_CUBLAS                          "llama: use CUDA"                                ON)
-set(LLAMA_CUDA_PEER_MAX_BATCH_SIZE "128" CACHE STRING
+set(LLAMA_CUDA_PEER_MAX_BATCH_SIZE "0" CACHE STRING
                                              "llama: max. batch size for using peer access")
 
 option(LLAMA_HIPBLAS                         "llama: use hipBLAS"                               OFF)
@@ -143,29 +143,13 @@ if (LLAMA_CUBLAS)
         set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} CUDA::cuda_driver)
 
     # CUDA graphs are independent of whether GPU architectures were supplied.
-    if(CUDAToolkit_VERSION VERSION_GREATER 12)
+    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.0")
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()
 
-    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        # 50 == lowest CUDA 12 standard
-        # 60 == f16 CUDA intrinsics
-        # 61 == integer CUDA intrinsics
-        # 70 == (assumed) compute capability at which unrolling a loop in mul_mat_q kernels is faster
-        # 75 == int8 tensor cores
-        # 80 == Ampere, asynchronous data loading, faster tensor core instructions
-        message("CUDA Toolkit Version: ${CUDAToolkit_VERSION}")
-        if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13)
-                add_compile_definitions(KCPP_LIMIT_CUDA_MAX_ARCH=860)
-                set(CMAKE_CUDA_ARCHITECTURES "75-virtual;80-virtual;86-virtual") # lowest CUDA 13 standard
-        elseif(CUDAToolkit_VERSION VERSION_GREATER 12)
-                add_compile_definitions(KCPP_LIMIT_CUDA_MAX_ARCH=800)
-                set(CMAKE_CUDA_ARCHITECTURES "50-virtual;61-virtual;75-virtual;80-virtual") # lowest CUDA 12 standard + lowest for integer intrinsics
-        else()
-                add_compile_definitions(KCPP_LIMIT_CUDA_MAX_ARCH=750) #will cause issues with ggml_cuda_highest_compiled_arch if removed
-                set(CMAKE_CUDA_ARCHITECTURES "35-virtual;50-virtual;61-virtual;75-virtual") # lowest CUDA 12 standard + lowest for integer intrinsics
-        endif()
-    endif()
+    message("CUDA Toolkit Version: ${CUDAToolkit_VERSION}")
+    add_compile_definitions(KCPP_LIMIT_CUDA_MAX_ARCH=600)
+    set(CMAKE_CUDA_ARCHITECTURES "60-real" CACHE STRING "Target Tesla P100 sm_60" FORCE)
     message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
     else()
@@ -351,9 +335,6 @@ elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "^(x86_64|i686|AMD64)$")
                 add_compile_definitions($<$<COMPILE_LANGUAGE:C>:__AVX512VNNI__>)
                 add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:__AVX512VNNI__>)
             endif()
-        elseif (LLAMA_AVX2)
-            add_compile_options($<$<COMPILE_LANGUAGE:C>:/arch:AVX2>)
-            add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
         elseif (LLAMA_AVX)
             add_compile_options($<$<COMPILE_LANGUAGE:C>:/arch:AVX>)
             add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/arch:AVX>)
@@ -707,4 +688,3 @@ if (LLAMA_HIPBLAS)
     COMMENT "Copying DLL to parent directory"
     )
 endif()
-
