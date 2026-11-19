@@ -53,15 +53,15 @@ jobs:
         with:
           python-version: 3.8.10
 
-      - name: Apply Tesla P100 sm_60 Patches (common.cuh + mmvq.cu)
+      - name: Apply Tesla P100 sm_60 & NoAVX2 Patches (common.cuh + mmvq.cu + koboldcpp.py)
         shell: python
         run: |
           import difflib, re, sys
 
-          def apply_exact_sub(path, src, pattern, replacement, label):
+          def apply_exact_sub(path, src, pattern, replacement, label, expected=1):
               patched, count = re.subn(pattern, replacement, src, flags=re.MULTILINE)
-              if count != 1:
-                  print(f"[P100 Patch] ERROR ({label}) in {path}: expected 1 match, got {count}", file=sys.stderr)
+              if count != expected:
+                  print(f"[P100 Patch] ERROR ({label}) in {path}: expected {expected} match(es), got {count}", file=sys.stderr)
                   sys.exit(1)
               return patched
 
@@ -161,6 +161,27 @@ jobs:
                   f.write(mmvq_new)
               print(f"[P100 Patch] Successfully patched {mmvq_path}.")
               print("".join(difflib.unified_diff(mmvq_orig.splitlines(True), mmvq_new.splitlines(True), fromfile=mmvq_path, tofile=mmvq_path)))
+
+          # 3. koboldcpp.py: allow AVX1-only CPUs (no AVX2) to auto-select CUDA in GUI & CLI
+          kcpp_path = "koboldcpp.py"
+          with open(kcpp_path, "r", encoding="utf-8", newline="") as f:
+              kcpp_orig = f.read()
+
+          if "eligible_cuda = (cpusupport<2) # P100 no-AVX2 build" in kcpp_orig:
+              print(f"[P100 Patch] {kcpp_path} already patched, skipping.")
+          else:
+              kcpp_new = apply_exact_sub(
+                  kcpp_path,
+                  kcpp_orig,
+                  r"eligible_cuda\s*=\s*\(\s*cpusupport\s*<\s*1\s+and\s+not\s+is_oldpc_ver\s*\)\s+or\s+\(\s*cpusupport\s*<\s*2\s+and\s+is_oldpc_ver\s*\)",
+                  "eligible_cuda = (cpusupport<2) # P100 no-AVX2 build",
+                  "koboldcpp.py eligible_cuda",
+                  expected=2
+              )
+              with open(kcpp_path, "w", encoding="utf-8", newline="") as f:
+                  f.write(kcpp_new)
+              print(f"[P100 Patch] Successfully patched {kcpp_path}.")
+              print("".join(difflib.unified_diff(kcpp_orig.splitlines(True), kcpp_new.splitlines(True), fromfile=kcpp_path, tofile=kcpp_path)))
 
       - name: Install python dependencies
         run: |
